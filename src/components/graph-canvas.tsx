@@ -15,12 +15,14 @@ const TYPE_COLOR: Record<string, string> = {
 };
 
 const TYPE_RING: Record<string, number> = {
-  Service: 0.32,
-  Person: 0.52,
-  Team: 0.68,
-  Decision: 0.78,
-  Doc: 0.86,
-  Incident: 0.92,
+  Service: 0.28,
+  Person: 0.48,
+  Team: 0.62,
+  Decision: 0.74,
+  Doc: 0.84,
+  Incident: 0.94,
+  PR: 0.88,
+  Ticket: 0.9,
 };
 
 type Props = {
@@ -71,20 +73,21 @@ export function GraphCanvas({ data, highlights = [], loading }: Props) {
         (idx / Math.max(group.length, 1)) * Math.PI * 2 -
         Math.PI / 2 +
         (n.type === "Person" ? 0.15 : 0);
-      const r = base * ring * 0.48;
+      const r = base * ring * 0.46;
       // Extra radial jitter by id hash so labels aren't stacked
       const hash = Array.from(n.id).reduce((a, c) => a + c.charCodeAt(0), 0);
-      const jr = ((hash % 7) - 3) * (base * 0.012);
-      const ja = ((hash % 5) - 2) * 0.04;
+      const jr = ((hash % 9) - 4) * (base * 0.018);
+      const ja = ((hash % 7) - 3) * 0.055;
       return {
         ...n,
         x: cx + Math.cos(angle + ja) * (r + jr),
         y: cy + Math.sin(angle + ja) * (r + jr),
+        hash,
       };
     });
 
-    // Mild repulsion pass to push overlapping labels apart
-    for (let iter = 0; iter < 40; iter++) {
+    // Stronger repulsion so node+label footprints separate
+    for (let iter = 0; iter < 80; iter++) {
       for (let i = 0; i < nodes.length; i++) {
         for (let j = i + 1; j < nodes.length; j++) {
           const a = nodes[i];
@@ -92,9 +95,9 @@ export function GraphCanvas({ data, highlights = [], loading }: Props) {
           const dx = b.x - a.x;
           const dy = b.y - a.y;
           const dist = Math.hypot(dx, dy) || 0.01;
-          const minDist = 36;
+          const minDist = 52;
           if (dist < minDist) {
-            const push = ((minDist - dist) / dist) * 0.35;
+            const push = ((minDist - dist) / dist) * 0.45;
             const ox = dx * push;
             const oy = dy * push;
             a.x -= ox;
@@ -103,6 +106,12 @@ export function GraphCanvas({ data, highlights = [], loading }: Props) {
             b.y += oy;
           }
         }
+      }
+      // Keep nodes inside canvas with padding for labels
+      const pad = 28;
+      for (const n of nodes) {
+        n.x = Math.min(width - pad, Math.max(pad, n.x));
+        n.y = Math.min(height - pad, Math.max(pad, n.y));
       }
     }
 
@@ -163,20 +172,40 @@ export function GraphCanvas({ data, highlights = [], loading }: Props) {
     for (const n of nodes) {
       const hot =
         highlightSet.has(n.id.toLowerCase()) ||
-        highlightSet.has(n.label.toLowerCase());
+        highlightSet.has(n.label.toLowerCase()) ||
+        highlightSet.has(n.label.replace(/\s*\(left\)\s*$/i, "").toLowerCase());
       const text = n.label.slice(0, 22);
       const tw = ctx.measureText(text).width;
-      const lx = n.x + 11;
-      const ly = n.y + 3;
-      const box = { x: lx, y: ly - 8, w: tw + 4, h: 12 };
-      const overlaps = labelBoxes.some(
+      // Alternate label side/offset by hash to reduce collisions
+      const side = n.hash % 2 === 0 ? 1 : -1;
+      const lx = side > 0 ? n.x + 11 : n.x - 11 - tw;
+      const ly = n.y + ((n.hash % 5) - 2) * 4;
+      const box = { x: lx - 2, y: ly - 9, w: tw + 6, h: 13 };
+      let overlaps = labelBoxes.some(
         (b) =>
           box.x < b.x + b.w &&
           box.x + box.w > b.x &&
           box.y < b.y + b.h &&
           box.y + box.h > b.y,
       );
-      // Always label highlights; otherwise skip if crowded
+      // Nudge vertically once if crowded
+      if (overlaps && !hot) {
+        box.y += 12;
+        const ly2 = ly + 12;
+        overlaps = labelBoxes.some(
+          (b) =>
+            box.x < b.x + b.w &&
+            box.x + box.w > b.x &&
+            box.y < b.y + b.h &&
+            box.y + box.h > b.y,
+        );
+        if (overlaps) continue;
+        labelBoxes.push(box);
+        ctx.fillStyle = "rgba(28, 34, 30, 0.88)";
+        ctx.fillText(text, lx, ly2);
+        continue;
+      }
+      // Always label highlights; otherwise skip if still crowded
       if (overlaps && !hot) continue;
       labelBoxes.push(box);
       ctx.fillStyle = "rgba(28, 34, 30, 0.88)";
