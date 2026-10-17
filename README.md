@@ -29,6 +29,23 @@ Open [http://localhost:3456](http://localhost:3456). The first ask auto-seeds th
 
 Optional: `npm run seed` to reset the graph from the CLI.
 
+## Deploy (Vercel)
+
+Brainny is a Next.js app. Point env vars at a **hosted** FalkorDB (Cloud free tier or any public Redis-protocol endpoint) — Vercel cannot run the Docker DB.
+
+```bash
+# Required on Vercel
+FALKORDB_HOST=...
+FALKORDB_PORT=...
+FALKORDB_PASSWORD=...
+FALKORDB_GRAPH=brainny
+# Optional (Cloud free has no TLS)
+# FALKORDB_USERNAME=falkordb
+# FALKORDB_TLS=true
+```
+
+After deploy, hit `POST /api/seed` once (or ask any question — first ask auto-seeds).
+
 ## Try these questions
 
 - Who should review the payments refactor?

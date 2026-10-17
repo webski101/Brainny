@@ -6,19 +6,26 @@ const globalForFalkor = globalThis as unknown as {
 };
 
 export function getConfig() {
+  const tlsEnv = process.env.FALKORDB_TLS;
   return {
     host: process.env.FALKORDB_HOST || "127.0.0.1",
     port: Number(process.env.FALKORDB_PORT || 6380),
     graphName: process.env.FALKORDB_GRAPH || "brainny",
+    username: process.env.FALKORDB_USERNAME || undefined,
+    password: process.env.FALKORDB_PASSWORD || undefined,
+    // Free Cloud has no TLS; paid tiers / custom may enable it
+    tls: tlsEnv === "1" || tlsEnv === "true",
   };
 }
 
 export async function getDb(): Promise<FalkorDB> {
   if (globalForFalkor.brainnyDb) return globalForFalkor.brainnyDb;
   if (!globalForFalkor.brainnyConnecting) {
-    const { host, port } = getConfig();
+    const { host, port, username, password, tls } = getConfig();
     globalForFalkor.brainnyConnecting = FalkorDB.connect({
-      socket: { host, port },
+      username,
+      password,
+      socket: { host, port, tls },
     }).then((db) => {
       globalForFalkor.brainnyDb = db;
       return db;
