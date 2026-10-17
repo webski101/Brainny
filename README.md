@@ -41,17 +41,25 @@ Optional: `npm run seed` to reset the graph from the CLI.
 
 ## Deploy (Vercel)
 
+Prefer **FalkorDB Cloud** (free tier) so production does not depend on a local tunnel:
+
+1. Create a Free instance at [app.falkordb.cloud](https://app.falkordb.cloud).
+2. Copy Host / Port from **Connectivity** (or the Connect browser login), user `falkordb`, and your password.
+3. Set Vercel env:
+
 ```bash
-FALKORDB_HOST=...
+FALKORDB_HOST=...          # from Connectivity
 FALKORDB_PORT=...
+FALKORDB_USERNAME=falkordb
 FALKORDB_PASSWORD=...
 FALKORDB_GRAPH=brainny
-# Optional (Cloud free has no TLS)
-# FALKORDB_USERNAME=falkordb
-# FALKORDB_TLS=true
+# Free Cloud has no TLS — do not set FALKORDB_TLS
+BRAINNY_DECIDE_SECRET=...  # protects POST /api/decide
 ```
 
-After deploy, hit `POST /api/seed` once (or ask any question — first ask auto-seeds).
+4. Redeploy, then `POST /api/seed` once (or ask any question — first ask auto-seeds).
+
+Local Docker (`localhost:6380`) is still fine for development.
 
 ## Try these questions
 
