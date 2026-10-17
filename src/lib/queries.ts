@@ -337,6 +337,302 @@ export async function companyOverview() {
   return runQuery(cypher);
 }
 
+/**
+ * Multi-hop blast radius: services that DEPENDS_ON* a target (1–4 hops).
+ * A flat table cannot answer "who is affected three hops upstream" without joins.
+ */
+export async function blastRadius(serviceHint: string) {
+  const tokens = expandTopic(serviceHint);
+  const hint = serviceHint.toLowerCase().replace(/[^a-z0-9-]+/g, " ").trim();
+  const cypher = `
+    MATCH (target:Service)
+    WHERE toLower(target.name) CONTAINS $hint
+       OR ANY(token IN $tokens WHERE
+            toLower(target.name) CONTAINS token OR
+            toLower(target.desc) CONTAINS token)
+    WITH target,
+      CASE
+        WHEN toLower(target.name) = $hint THEN 0
+        WHEN toLower(target.name) CONTAINS $hint THEN 1
+        WHEN ANY(token IN $tokens WHERE toLower(target.name) CONTAINS token) THEN 2
+        ELSE 3
+      END AS rank
+    ORDER BY rank ASC
+    WITH target LIMIT 1
+    MATCH path = (upstream:Service)-[:DEPENDS_ON*1..4]->(target)
+    WITH target, upstream, length(path) AS hops
+    OPTIONAL MATCH (knower:Person)-[k:KNOWS]->(upstream)
+    WHERE knower.active = true
+    WITH target, upstream, hops, upstream.criticality AS criticality,
+         collect(DISTINCT knower.name)[0..3] AS knowers
+    RETURN target.name AS target,
+           upstream.name AS affected,
+           hops,
+           criticality,
+           knowers
+    ORDER BY hops ASC, criticality DESC
+  `;
+  const { rows, cypher: used } = await runQuery<{
+    target: string;
+    affected: string;
+    hops: number;
+    criticality: string;
+    knowers: string[];
+  }>(cypher, { tokens, hint });
+
+  const path: PathHop[] = rows.slice(0, 8).map((r) => ({
+    from: asString(r.affected),
+    rel: `DEPENDS_ON×${asNumber(r.hops)}`,
+    to: asString(r.target),
+    detail: asString(r.criticality),
+  }));
+
+  const sources: SourceRef[] = [
+    ...new Map(
+      rows.map((r) => [
+        asString(r.affected),
+        {
+          id: asString(r.affected),
+          kind: "Service",
+          title: `${asString(r.affected)} (${asNumber(r.hops)} hop${asNumber(r.hops) === 1 ? "" : "s"})`,
+          status: "active" as const,
+        },
+      ]),
+    ).values(),
+  ];
+
+  return {
+    target: rows[0] ? asString(rows[0].target) : null,
+    rows: rows.map((r) => ({
+      affected: asString(r.affected),
+      hops: asNumber(r.hops),
+      criticality: asString(r.criticality),
+      knowers: (Array.isArray(r.knowers) ? r.knowers : []).filter(Boolean).map(String),
+    })),
+    path,
+    sources,
+    cypher: [used],
+  };
+}
+
+/**
+ * Multi-hop: person → KNOWS → service ← DEPENDS_ON* — what goes dark if they leave,
+ * including upstream callers that never appear on their org chart.
+ */
+export async function departureBlastRadius(personName: string) {
+  const cypher = `
+    MATCH (p:Person)
+    WHERE toLower(p.name) CONTAINS toLower($name)
+    MATCH (p)-[:KNOWS]->(s:Service)
+    OPTIONAL MATCH path = (upstream:Service)-[:DEPENDS_ON*1..3]->(s)
+    WITH p, s, collect(DISTINCT {
+      name: upstream.name,
+      hops: CASE WHEN upstream IS NULL THEN 0 ELSE length(path) END,
+      criticality: upstream.criticality
+    }) AS upstreams
+    RETURN p.name AS person,
+           s.name AS service,
+           s.criticality AS criticality,
+           [u IN upstreams WHERE u.name IS NOT NULL] AS upstreams
+    ORDER BY s.criticality DESC
+  `;
+  const { rows, cypher: used } = await runQuery<{
+    person: string;
+    service: string;
+    criticality: string;
+    upstreams: { name: string; hops: number; criticality: string }[];
+  }>(cypher, { name: personName });
+
+  const path: PathHop[] = [];
+  for (const r of rows.slice(0, 5)) {
+    path.push({
+      from: asString(r.person),
+      rel: "KNOWS",
+      to: asString(r.service),
+    });
+    for (const u of (r.upstreams || []).slice(0, 3)) {
+      path.push({
+        from: asString(u.name),
+        rel: `DEPENDS_ON×${asNumber(u.hops)}`,
+        to: asString(r.service),
+        detail: "at risk if knower leaves",
+      });
+    }
+  }
+
+  const sources: SourceRef[] = rows.map((r) => ({
+    id: asString(r.service),
+    kind: "Service",
+    title: asString(r.service),
+    status: "active",
+  }));
+
+  return {
+    person: rows[0] ? asString(rows[0].person) : personName,
+    rows: rows.map((r) => ({
+      service: asString(r.service),
+      criticality: asString(r.criticality),
+      upstreams: (r.upstreams || [])
+        .filter((u) => u?.name)
+        .map((u) => ({
+          name: asString(u.name),
+          hops: asNumber(u.hops),
+          criticality: asString(u.criticality),
+        })),
+    })),
+    path,
+    sources,
+    cypher: [used],
+  };
+}
+
+/**
+ * Multi-hop expertise path: Person -[:WROTE|REVIEWED]-> PR -[:TOUCHES]-> Service
+ * plus optional DEPENDS_ON hop to related services.
+ */
+export async function expertisePaths(topic: string) {
+  const tokens = expandTopic(topic);
+  const cypher = `
+    MATCH (p:Person)-[work:WROTE|REVIEWED]->(pr:PR)-[:TOUCHES]->(s:Service)
+    WHERE p.active = true AND ANY(token IN $tokens WHERE
+      toLower(s.name) CONTAINS token OR
+      toLower(s.desc) CONTAINS token OR
+      toLower(pr.title) CONTAINS token
+    )
+    OPTIONAL MATCH (s)-[:DEPENDS_ON]->(dep:Service)
+    OPTIONAL MATCH (p)-[:MEMBER_OF]->(t:Team)
+    WITH p, t, s, dep, type(work) AS workRel, collect(DISTINCT pr.title) AS prTitles
+    RETURN p.name AS name, p.role AS role, coalesce(t.name,'') AS team,
+           s.name AS service, workRel, prTitles,
+           collect(DISTINCT dep.name) AS dependsOn
+    ORDER BY size(prTitles) DESC
+    LIMIT 8
+  `;
+  const { rows, cypher: used } = await runQuery<{
+    name: string;
+    role: string;
+    team: string;
+    service: string;
+    workRel: string;
+    prTitles: string[];
+    dependsOn: (string | null)[];
+  }>(cypher, { tokens });
+
+  const path: PathHop[] = rows.flatMap((r) => {
+    const hops: PathHop[] = [
+      {
+        from: asString(r.name),
+        rel: asString(r.workRel),
+        to: (r.prTitles || [])[0] || "PR",
+      },
+      {
+        from: (r.prTitles || [])[0] || "PR",
+        rel: "TOUCHES",
+        to: asString(r.service),
+      },
+    ];
+    for (const d of (r.dependsOn || []).filter(Boolean).slice(0, 1)) {
+      hops.push({
+        from: asString(r.service),
+        rel: "DEPENDS_ON",
+        to: String(d),
+      });
+    }
+    return hops;
+  });
+
+  const sources: SourceRef[] = rows.map((r) => ({
+    id: asString(r.name),
+    kind: "Person",
+    title: `${asString(r.name)} · ${asString(r.role)}`,
+    status: "active",
+  }));
+
+  return {
+    rows: rows.map((r) => ({
+      name: asString(r.name),
+      role: asString(r.role),
+      team: asString(r.team),
+      service: asString(r.service),
+      workRel: asString(r.workRel),
+      prs: (r.prTitles || []).filter(Boolean).map(String),
+      dependsOn: (r.dependsOn || []).filter(Boolean).map(String),
+    })),
+    path,
+    sources,
+    cypher: [used],
+  };
+}
+
+/** Multi-hop SUPERSEDES chain for decision provenance */
+export async function decisionLineage(topic: string) {
+  const tokens = expandTopic(topic);
+  // Prefer an active match, then walk SUPERSEDES*1..4 to older decisions
+  const cypher = `
+    MATCH (d:Decision)
+    WHERE ANY(token IN $tokens WHERE
+      toLower(d.title) CONTAINS token OR
+      toLower(d.summary) CONTAINS token
+    )
+    WITH d
+    ORDER BY CASE WHEN d.status = 'active' THEN 0 ELSE 1 END, d.decidedAt DESC
+    LIMIT 1
+    OPTIONAL MATCH (d)-[:SUPERSEDES*1..4]->(older:Decision)
+    OPTIONAL MATCH (owner:Person)-[:DECIDED]->(d)
+    OPTIONAL MATCH (d)-[:CITES]->(src)
+    RETURN d.title AS current, d.status AS status, d.decidedAt AS decidedAt,
+           collect(DISTINCT older.title) AS olderTitles,
+           collect(DISTINCT older.decidedAt) AS olderDates,
+           collect(DISTINCT owner.name) AS owners,
+           collect(DISTINCT coalesce(src.title, src.id)) AS cites
+  `;
+  const { rows, cypher: used } = await runQuery<{
+    current: string;
+    status: string;
+    decidedAt: string;
+    olderTitles: (string | null)[];
+    olderDates: (string | null)[];
+    owners: string[];
+    cites: string[];
+  }>(cypher, { tokens });
+
+  if (!rows.length) {
+    return {
+      current: null as string | null,
+      lineage: [] as string[],
+      path: [] as PathHop[],
+      sources: [] as SourceRef[],
+      cypher: [used],
+    };
+  }
+
+  const r = rows[0];
+  const older = (r.olderTitles || []).filter(Boolean).map(String);
+  const lineage = [asString(r.current), ...older];
+  const path: PathHop[] = older.map((title) => ({
+    from: asString(r.current),
+    rel: "SUPERSEDES",
+    to: title,
+  }));
+
+  return {
+    current: asString(r.current),
+    status: asString(r.status),
+    decidedAt: asString(r.decidedAt),
+    lineage,
+    owners: (r.owners || []).filter(Boolean).map(String),
+    cites: (r.cites || []).filter(Boolean).map(String),
+    path,
+    sources: lineage.map((title, i) => ({
+      id: title,
+      kind: "Decision",
+      title,
+      status: i === 0 ? ("active" as const) : ("superseded" as const),
+    })),
+    cypher: [used],
+  };
+}
+
 export async function recordDecision(input: {
   title: string;
   summary: string;

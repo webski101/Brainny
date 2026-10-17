@@ -1,8 +1,12 @@
 import type { AgentAnswer } from "./types";
 import {
+  blastRadius,
   busFactor,
   companyOverview,
   decisionAutopsy,
+  decisionLineage,
+  departureBlastRadius,
+  expertisePaths,
   findExperts,
   whoOwns,
 } from "./queries";
@@ -16,7 +20,9 @@ function normalize(q: string) {
 function extractPerson(q: string): string | undefined {
   const leave = q.match(/if\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+leaves/i);
   if (leave) return leave[1];
-  const named = q.match(/\b(priya|marcus|lena|jon|aya|sam|nina|dev|kai|owen|rita|eli)(?:\s+\w+)?/i);
+  const named = q.match(
+    /\b(priya|marcus|lena|jon|aya|sam|nina|dev|kai|owen|rita|eli)(?:\s+\w+)?/i,
+  );
   if (named) return named[1];
   return undefined;
 }
@@ -34,9 +40,22 @@ function extractTopic(q: string): string {
   const owns = q.match(/own(?:s|ership)?\s+(?:of\s+)?(.+?)(?:\?|$)/i);
   if (owns) return owns[1].trim();
 
+  const down = q.match(
+    /(?:if|when)\s+([a-z0-9-]+)\s+(?:goes\s+down|is\s+down|dies|fails|outage)/i,
+  );
+  if (down) return down[1].trim();
+
+  const blast = q.match(
+    /(?:blast\s*radius|depends\s+on|upstream\s+of|downstream\s+of)\s+(.+?)(?:\?|$)/i,
+  );
+  if (blast) return blast[1].trim();
+
   return q
     .replace(/\?/g, "")
-    .replace(/\b(who|what|which|should|i|ask|about|the|a|an|for|to|of|is|are|can|we|our)\b/gi, " ")
+    .replace(
+      /\b(who|what|which|should|i|ask|about|the|a|an|for|to|of|is|are|can|we|our|goes|down|if|when)\b/gi,
+      " ",
+    )
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -65,14 +84,68 @@ export async function askBrainny(question: string): Promise<AgentAnswer> {
     return {
       status: "abstain",
       intent: "empty",
-      answer: "Ask Brainny something about Northstar Pay — people, services, decisions, or bus factor.",
+      answer:
+        "Ask Brainny something about Northstar Pay — people, services, decisions, or blast radius.",
       path: [],
       sources: [],
       cypher: [],
     };
   }
 
-  // Bus factor / departure risk
+  // Multi-hop service blast radius (DEPENDS_ON*1..4)
+  if (
+    (q.includes("goes down") ||
+      q.includes("is down") ||
+      q.includes("blast radius") ||
+      q.includes("depends on") ||
+      q.includes("outage") ||
+      q.includes("what fails") ||
+      (q.includes("what breaks") && !extractPerson(question))) &&
+    !q.includes("leaves")
+  ) {
+    const topic = extractTopic(question) || "card-rails";
+    const result = await blastRadius(topic);
+
+    if (!result.target || !result.rows.length) {
+      return {
+        status: "abstain",
+        intent: "blast_radius",
+        answer: `No DEPENDS_ON paths found for “${topic}”. Try card-rails, ledger-core, or settlement.`,
+        path: [],
+        sources: [],
+        cypher: result.cypher,
+      };
+    }
+
+    const byHop = new Map<number, typeof result.rows>();
+    for (const row of result.rows) {
+      const list = byHop.get(row.hops) || [];
+      list.push(row);
+      byHop.set(row.hops, list);
+    }
+
+    const sections = [...byHop.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([hops, rows]) => {
+        const lines = rows.map(
+          (r) =>
+            `• **${r.affected}** (${r.criticality}) — knowers: ${r.knowers.join(", ") || "none"}`,
+        );
+        return `${hops}-hop upstream:\n${lines.join("\n")}`;
+      });
+
+    return {
+      status: "ok",
+      intent: "blast_radius",
+      answer: `If **${result.target}** goes down, FalkorDB walks \`DEPENDS_ON*1..4\` (variable-length path — not a single join):\n\n${sections.join("\n\n")}\n\nDepth matters: 1-hop looks like a table join; 3–4 hops surface callers the org chart never lists.`,
+      path: result.path,
+      sources: result.sources,
+      cypher: result.cypher,
+      highlights: [result.target, ...result.rows.map((r) => r.affected)],
+    };
+  }
+
+  // Bus factor / departure risk — plus multi-hop upstream callers of services they know
   if (
     q.includes("bus factor") ||
     q.includes("leaves") ||
@@ -104,7 +177,12 @@ export async function askBrainny(question: string): Promise<AgentAnswer> {
         person
           ? {
               ...b,
-              criticalPeople: [person, ...b.criticalPeople.filter((n) => n.toLowerCase() !== person.toLowerCase())].slice(0, 3),
+              criticalPeople: [
+                person,
+                ...b.criticalPeople.filter(
+                  (n) => n.toLowerCase() !== person.toLowerCase(),
+                ),
+              ].slice(0, 3),
             }
           : b,
     );
@@ -113,25 +191,50 @@ export async function askBrainny(question: string): Promise<AgentAnswer> {
         `• **${b.service}** — ${b.score}% concentration (${b.risk}). Key people: ${b.criticalPeople.join(", ") || "none active"}`,
     );
 
-    const answer = person
+    let answer = person
       ? `If **${person}** left, these services lose disproportionate knowledge:\n\n${lines.join("\n")}\n\nBrainny measured this from KNOWS edges (PRs, incidents, tickets, ownership) — not job titles.`
       : `Company-wide bus factor hotspots:\n\n${lines.join("\n")}\n\nCritical services with one dominant knower are highlighted for review.`;
+
+    let path = result.path.map((p) => (person ? { ...p, from: person } : p));
+    let sources = result.sources;
+    const cypher = [...result.cypher];
+    const highlights = focus.map((b) => b.service);
+
+    if (person) {
+      const dep = await departureBlastRadius(person);
+      cypher.push(...dep.cypher);
+      path = [...path, ...dep.path];
+      sources = [...sources, ...dep.sources];
+      const upstreamLines = dep.rows
+        .filter((r) => r.upstreams.length)
+        .slice(0, 4)
+        .map((r) => {
+          const ups = r.upstreams
+            .map((u) => `${u.name} (${u.hops} hop${u.hops === 1 ? "" : "s"})`)
+            .join(", ");
+          return `• Via **${r.service}**: upstream at risk → ${ups}`;
+        });
+      if (upstreamLines.length) {
+        answer += `\n\nMulti-hop blast beyond their direct services (\`Person-KNOWS→Service←DEPENDS_ON*\`):\n${upstreamLines.join("\n")}`;
+        for (const r of dep.rows) {
+          for (const u of r.upstreams) highlights.push(u.name);
+        }
+      }
+    }
 
     return {
       status: critical.some((c) => c.risk === "critical") ? "partial" : "ok",
       intent: "bus_factor",
       answer,
-      path: result.path.map((p) =>
-        person ? { ...p, from: person } : p,
-      ),
-      sources: result.sources,
-      cypher: result.cypher,
+      path,
+      sources,
+      cypher,
       busFactor: focus,
-      highlights: focus.map((b) => b.service),
+      highlights: [...new Set(highlights)],
     };
   }
 
-  // Decision autopsy
+  // Decision autopsy + multi-hop SUPERSEDES lineage
   if (
     q.includes("why did we") ||
     q.includes("why do we") ||
@@ -141,10 +244,13 @@ export async function askBrainny(question: string): Promise<AgentAnswer> {
     q.includes("pick") ||
     q.includes("stripe") ||
     q.includes("adyen") ||
-    q.includes("psp")
+    q.includes("psp") ||
+    q.includes("lineage") ||
+    q.includes("supersede")
   ) {
     const topic = extractTopic(question) || "psp";
     const result = await decisionAutopsy(topic);
+    const lineage = await decisionLineage(topic);
 
     if (!result.decision) {
       return {
@@ -153,20 +259,25 @@ export async function askBrainny(question: string): Promise<AgentAnswer> {
         answer: result.reason || "No matching decision with sources in the graph.",
         path: [],
         sources: [],
-        cypher: result.cypher,
+        cypher: [...result.cypher, ...lineage.cypher],
         decision: null,
       };
     }
 
     const d = result.decision;
+    const lineageNote =
+      lineage.lineage.length > 1
+        ? `\n\nSUPERSEDES chain (${lineage.lineage.length} hops): ${lineage.lineage.join(" → ")}`
+        : "";
+
     if (result.abstain && d.supersededBy) {
       return {
         status: "abstain",
         intent: "decision_autopsy",
-        answer: `${result.reason}\n\nHistorical summary (not current policy): ${d.summary}\nOwners then: ${d.owners.join(", ")}. Evidence: ${d.cites.join("; ") || "none"}.`,
-        path: result.path,
-        sources: result.sources,
-        cypher: result.cypher,
+        answer: `${result.reason}\n\nHistorical summary (not current policy): ${d.summary}\nOwners then: ${d.owners.join(", ")}. Evidence: ${d.cites.join("; ") || "none"}.${lineageNote}`,
+        path: [...result.path, ...lineage.path],
+        sources: [...result.sources, ...lineage.sources],
+        cypher: [...result.cypher, ...lineage.cypher],
         decision: d,
       };
     }
@@ -174,10 +285,10 @@ export async function askBrainny(question: string): Promise<AgentAnswer> {
     return {
       status: "ok",
       intent: "decision_autopsy",
-      answer: `**${d.title}** (${d.decidedAt})\n\n${d.summary}\n\nOwners: ${d.owners.join(", ") || "unknown"}.\nCited evidence: ${d.cites.join("; ") || "none linked"}.\n\nEvery hop above is a FalkorDB edge — Brainny will not invent provenance.`,
-      path: result.path,
-      sources: result.sources,
-      cypher: result.cypher,
+      answer: `**${d.title}** (${d.decidedAt})\n\n${d.summary}\n\nOwners: ${d.owners.join(", ") || "unknown"}.\nCited evidence: ${d.cites.join("; ") || "none linked"}.${lineageNote}\n\nEvery hop above is a FalkorDB edge — Brainny will not invent provenance.`,
+      path: [...result.path, ...lineage.path],
+      sources: [...result.sources, ...lineage.sources],
+      cypher: [...result.cypher, ...lineage.cypher],
       decision: d,
     };
   }
@@ -209,7 +320,10 @@ export async function askBrainny(question: string): Promise<AgentAnswer> {
         (w) => Number(w) || 1,
       );
       const knowers = names
-        .map((name, i) => `${name} (weight ${weights[i] || 1}${roles[i] ? `, ${roles[i]}` : ""})`)
+        .map(
+          (name, i) =>
+            `${name} (weight ${weights[i] || 1}${roles[i] ? `, ${roles[i]}` : ""})`,
+        )
         .slice(0, 4)
         .join("; ");
       return `**${r.service}** (${r.criticality})\nDeclared owners: ${declared.join(", ") || "none"}\nEvidence-based knowers: ${knowers || "none"}`;
@@ -220,7 +334,9 @@ export async function askBrainny(question: string): Promise<AgentAnswer> {
       intent: "ownership",
       answer: `Declared ownership vs earned knowledge for “${topic}”:\n\n${blocks.join("\n\n")}\n\nTitles can lie. Brainny ranks people by graph evidence.`,
       path: rows.flatMap((r) => {
-        const declared = (Array.isArray(r.declaredOwners) ? r.declaredOwners : []) as string[];
+        const declared = (Array.isArray(r.declaredOwners)
+          ? r.declaredOwners
+          : []) as string[];
         return declared.slice(0, 2).map((name) => ({
           from: String(name),
           rel: "OWNS",
@@ -237,7 +353,7 @@ export async function askBrainny(question: string): Promise<AgentAnswer> {
     };
   }
 
-  // Expertise / who should review
+  // Expertise / who should review — with explicit multi-hop Person→PR→Service→DEPENDS_ON paths
   if (
     q.includes("who") ||
     q.includes("review") ||
@@ -247,6 +363,7 @@ export async function askBrainny(question: string): Promise<AgentAnswer> {
   ) {
     const topic = extractTopic(question) || "payments";
     const result = await findExperts(topic);
+    const paths = await expertisePaths(topic);
     const active = result.people.filter((p) => p.active);
 
     if (!active.length) {
@@ -254,9 +371,9 @@ export async function askBrainny(question: string): Promise<AgentAnswer> {
         status: "abstain",
         intent: "expertise",
         answer: `No active experts found for “${topic}”. Knowledge may be missing or only held by people who left.`,
-        path: result.path,
+        path: [...result.path, ...paths.path],
         sources: result.sources,
-        cypher: result.cypher,
+        cypher: [...result.cypher, ...paths.cypher],
         people: result.people,
       };
     }
@@ -266,13 +383,23 @@ export async function askBrainny(question: string): Promise<AgentAnswer> {
         `${i + 1}. **${p.name}** — ${p.role}, ${p.team} (score ${p.score})\n   Evidence: ${p.reasons.join("; ") || "graph degree"}`,
     );
 
+    const pathLines = paths.rows.slice(0, 4).map((r) => {
+      const dep =
+        r.dependsOn.length > 0 ? ` → DEPENDS_ON → ${r.dependsOn.join(", ")}` : "";
+      return `• ${r.name} -[:${r.workRel}]-> PR -[:TOUCHES]-> **${r.service}**${dep}`;
+    });
+
+    const pathBlock = pathLines.length
+      ? `\n\nMulti-hop evidence paths:\n${pathLines.join("\n")}`
+      : "";
+
     return {
       status: "ok",
       intent: "expertise",
-      answer: `Best people to involve for **${topic}**:\n\n${lines.join("\n")}\n\nRanked from FalkorDB KNOWS / PR / incident paths, not the org chart.`,
-      path: result.path,
-      sources: result.sources,
-      cypher: result.cypher,
+      answer: `Best people to involve for **${topic}**:\n\n${lines.join("\n")}${pathBlock}\n\nRanked from FalkorDB KNOWS / PR / incident paths, not the org chart.`,
+      path: [...result.path, ...paths.path],
+      sources: [...result.sources, ...paths.sources],
+      cypher: [...result.cypher, ...paths.cypher],
       people: active,
       highlights: active.map((p) => p.name),
     };
@@ -284,7 +411,7 @@ export async function askBrainny(question: string): Promise<AgentAnswer> {
   return {
     status: "ok",
     intent: "overview",
-    answer: `**${c.company || "Northstar Pay"}** — ${c.tagline || "company graph"}.\n\nBrainny currently tracks ${c.people || "?"} active people, ${c.services || "?"} services, and ${c.activeDecisions || "?"} active decisions.\n\nTry asking:\n• Who should review the payments refactor?\n• What breaks if Priya leaves?\n• Why did we pick Stripe over Adyen?\n• Who owns card-rails vs who actually knows it?`,
+    answer: `**${c.company || "Northstar Pay"}** — ${c.tagline || "company graph"}.\n\nBrainny currently tracks ${c.people || "?"} active people, ${c.services || "?"} services, and ${c.activeDecisions || "?"} active decisions.\n\nTry asking:\n• Who should review the payments refactor?\n• What breaks if Priya leaves?\n• What breaks if ledger-core goes down?\n• Why did we pick Stripe over Adyen?\n• Who owns card-rails vs who actually knows it?`,
     path: [],
     sources: [
       {

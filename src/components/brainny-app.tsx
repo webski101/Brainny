@@ -26,6 +26,7 @@ type ChatItem = {
 const PROMPTS = [
   "Who should review the payments refactor?",
   "What breaks if Priya leaves?",
+  "What breaks if ledger-core goes down?",
   "Why did we pick Stripe over Adyen?",
   "Who owns card-rails vs who actually knows it?",
 ];
