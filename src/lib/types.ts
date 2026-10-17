@@ -40,6 +40,8 @@ export type BusFactorHit = {
   criticalPeople: string[];
   score: number;
   risk: "critical" | "high" | "medium" | "low";
+  focusPerson?: string;
+  focusActive?: boolean;
 };
 
 export type DecisionHit = {

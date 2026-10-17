@@ -37,6 +37,12 @@ export const services = [
   { id: "s_sdk", name: "partner-sdk", criticality: "medium", desc: "Public SDK and API gateway" },
   { id: "s_identity", name: "identity", criticality: "high", desc: "Merchant auth and RBAC" },
   { id: "s_billing", name: "billing-ui", criticality: "low", desc: "Merchant billing dashboard" },
+  {
+    id: "s_notify",
+    name: "notify-hub",
+    criticality: "medium",
+    desc: "Merchant and ops notification fan-out",
+  },
 ];
 
 export const ownership = [
@@ -238,7 +244,10 @@ export const serviceDeps = [
   { from: "s_settle", to: "s_ledger", rel: "DEPENDS_ON" },
   { from: "s_webhooks", to: "s_rails", rel: "DEPENDS_ON" },
   { from: "s_sdk", to: "s_identity", rel: "DEPENDS_ON" },
+  // Multi-hop chain for blast-radius demos (notify → sdk → webhooks → rails → ledger = 4 hops)
+  { from: "s_sdk", to: "s_webhooks", rel: "DEPENDS_ON" },
   { from: "s_billing", to: "s_settle", rel: "DEPENDS_ON" },
+  { from: "s_notify", to: "s_sdk", rel: "DEPENDS_ON" },
 ];
 
 export const skills = [

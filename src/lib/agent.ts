@@ -8,6 +8,7 @@ import {
   departureBlastRadius,
   expertisePaths,
   findExperts,
+  personLabel,
   whoOwns,
 } from "./queries";
 import { graphExists } from "./falkordb";
@@ -34,10 +35,16 @@ function extractTopic(q: string): string {
   const about = q.match(/(?:about|on|for|regarding)\s+(.+?)(?:\?|$)/i);
   if (about) return about[1].trim();
 
-  const why = q.match(/why\s+(?:did\s+we\s+)?(?:pick|choose|decide|select)\s+(.+?)(?:\?|$)/i);
-  if (why) return why[1].trim();
+  // "Why did we decide to freeze settlements?" → "freeze settlements"
+  const why = q.match(
+    /why\s+(?:did\s+we\s+)?(?:pick|choose|decide(?:\s+to)?|select)\s+(.+?)(?:\?|$)/i,
+  );
+  if (why) return why[1].replace(/^to\s+/i, "").trim();
 
-  const owns = q.match(/own(?:s|ership)?\s+(?:of\s+)?(.+?)(?:\?|$)/i);
+  // "Who owns card-rails vs who actually knows it?" → "card-rails"
+  const owns = q.match(
+    /own(?:s|ership)?\s+(?:of\s+)?([a-z0-9-]+(?:\s+[a-z0-9-]+)?)/i,
+  );
   if (owns) return owns[1].trim();
 
   const down = q.match(
@@ -53,7 +60,7 @@ function extractTopic(q: string): string {
   return q
     .replace(/\?/g, "")
     .replace(
-      /\b(who|what|which|should|i|ask|about|the|a|an|for|to|of|is|are|can|we|our|goes|down|if|when)\b/gi,
+      /\b(who|what|which|should|i|ask|about|the|a|an|for|to|of|is|are|can|we|our|goes|down|if|when|vs|versus|actually|knows)\b/gi,
       " ",
     )
     .replace(/\s+/g, " ")
@@ -106,14 +113,33 @@ export async function askBrainny(question: string): Promise<AgentAnswer> {
     const topic = extractTopic(question) || "card-rails";
     const result = await blastRadius(topic);
 
-    if (!result.target || !result.rows.length) {
+    if (result.unknown || !result.target) {
       return {
         status: "abstain",
         intent: "blast_radius",
-        answer: `No DEPENDS_ON paths found for “${topic}”. Try card-rails, ledger-core, or settlement.`,
+        answer: `Unknown service “${topic}”. Try card-rails, ledger-core, settlement, or notify-hub.`,
         path: [],
         sources: [],
         cypher: result.cypher,
+      };
+    }
+
+    if (!result.rows.length) {
+      return {
+        status: "ok",
+        intent: "blast_radius",
+        answer: `**${result.target}** is in the graph, but nothing \`DEPENDS_ON\` it (no upstream callers in 1–4 hops). It can still fail on its own — there just isn’t a blast radius to walk.`,
+        path: [],
+        sources: [
+          {
+            id: result.target,
+            kind: "Service",
+            title: result.target,
+            status: "active",
+          },
+        ],
+        cypher: result.cypher,
+        highlights: [result.target],
       };
     }
 
@@ -172,15 +198,18 @@ export async function askBrainny(question: string): Promise<AgentAnswer> {
       };
     }
 
+    const focusPerson = result.person || person;
     const focus = (critical.length ? critical : result.busFactor.slice(0, 4)).map(
       (b) =>
-        person
+        focusPerson
           ? {
               ...b,
               criticalPeople: [
-                person,
+                focusPerson,
                 ...b.criticalPeople.filter(
-                  (n) => n.toLowerCase() !== person.toLowerCase(),
+                  (n) =>
+                    n.toLowerCase().replace(/\s*\(left\)\s*$/, "") !==
+                    focusPerson.toLowerCase().replace(/\s*\(left\)\s*$/, ""),
                 ),
               ].slice(0, 3),
             }
@@ -191,11 +220,13 @@ export async function askBrainny(question: string): Promise<AgentAnswer> {
         `• **${b.service}** — ${b.score}% concentration (${b.risk}). Key people: ${b.criticalPeople.join(", ") || "none active"}`,
     );
 
-    let answer = person
-      ? `If **${person}** left, these services lose disproportionate knowledge:\n\n${lines.join("\n")}\n\nBrainny measured this from KNOWS edges (PRs, incidents, tickets, ownership) — not job titles.`
+    let answer = focusPerson
+      ? `If **${focusPerson}** left, these services lose disproportionate knowledge:\n\n${lines.join("\n")}\n\nBrainny measured this from KNOWS edges (PRs, incidents, tickets, ownership) — not job titles.`
       : `Company-wide bus factor hotspots:\n\n${lines.join("\n")}\n\nCritical services with one dominant knower are highlighted for review.`;
 
-    let path = result.path.map((p) => (person ? { ...p, from: person } : p));
+    let path = result.path.map((p) =>
+      focusPerson ? { ...p, from: focusPerson } : p,
+    );
     let sources = result.sources;
     const cypher = [...result.cypher];
     const highlights = focus.map((b) => b.service);
@@ -296,12 +327,12 @@ export async function askBrainny(question: string): Promise<AgentAnswer> {
   // Ownership vs knowledge
   if (q.includes("own") || q.includes("owner") || q.includes("responsible")) {
     const topic = extractTopic(question) || "rails";
-    const { rows, cypher } = await whoOwns(topic);
-    if (!rows.length) {
+    const { rows, cypher, found } = await whoOwns(topic);
+    if (!found || !rows.length) {
       return {
         status: "abstain",
         intent: "ownership",
-        answer: `No service matched “${topic}”. Try card-rails, ledger-core, fraud-engine, or settlement.`,
+        answer: `Unknown service “${topic}”. Try card-rails, ledger-core, fraud-engine, or settlement.`,
         path: [],
         sources: [],
         cypher,
@@ -309,9 +340,15 @@ export async function askBrainny(question: string): Promise<AgentAnswer> {
     }
 
     const blocks = rows.map((r) => {
-      const declared = (Array.isArray(r.declaredOwners) ? r.declaredOwners : [])
+      const declaredRaw = (Array.isArray(r.declaredOwners) ? r.declaredOwners : [])
         .filter(Boolean)
         .map(String);
+      const declaredActive = (Array.isArray(r.declaredActive)
+        ? r.declaredActive
+        : []) as boolean[];
+      const declared = declaredRaw.map((n, i) =>
+        personLabel(n, declaredActive[i] ?? true),
+      );
       const names = (Array.isArray(r.knowerNames) ? r.knowerNames : [])
         .filter(Boolean)
         .map(String);
@@ -332,13 +369,16 @@ export async function askBrainny(question: string): Promise<AgentAnswer> {
     return {
       status: "ok",
       intent: "ownership",
-      answer: `Declared ownership vs earned knowledge for “${topic}”:\n\n${blocks.join("\n\n")}\n\nTitles can lie. Brainny ranks people by graph evidence.`,
+      answer: `Declared ownership vs earned knowledge for **${rows[0]?.service || topic}**:\n\n${blocks.join("\n\n")}\n\nTitles can lie. Brainny ranks people by graph evidence.`,
       path: rows.flatMap((r) => {
         const declared = (Array.isArray(r.declaredOwners)
           ? r.declaredOwners
           : []) as string[];
-        return declared.slice(0, 2).map((name) => ({
-          from: String(name),
+        const declaredActive = (Array.isArray(r.declaredActive)
+          ? r.declaredActive
+          : []) as boolean[];
+        return declared.slice(0, 2).map((name, i) => ({
+          from: personLabel(String(name), declaredActive[i] ?? true),
           rel: "OWNS",
           to: String(r.service),
         }));
@@ -350,6 +390,7 @@ export async function askBrainny(question: string): Promise<AgentAnswer> {
         status: "active" as const,
       })),
       cypher,
+      highlights: rows.map((r) => String(r.service)),
     };
   }
 

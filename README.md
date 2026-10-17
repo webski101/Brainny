@@ -227,8 +227,8 @@ No OpenAI/Anthropic call is required for the demo. Optional `OPENAI_API_KEY` in 
 |--------|------|---------|
 | `POST` | `/api/ask` | `{ "question": "..." }` → grounded answer + path + sources + Cypher |
 | `GET`  | `/api/graph` | Nodes/edges for the canvas |
-| `POST` | `/api/seed` | Reset & reseed Northstar Pay |
-| `POST` | `/api/decide` | Write a new `Decision` node into the graph |
+| `POST` | `/api/seed` | Reset & reseed Northstar Pay (POST only) |
+| `POST` | `/api/decide` | Write a new `Decision` (requires `X-Brainny-Secret` / `BRAINNY_DECIDE_SECRET`) |
 
 ## Stack
 

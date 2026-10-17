@@ -5,8 +5,27 @@ import { recordDecision } from "@/lib/queries";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+function authorized(request: Request) {
+  const expected = process.env.BRAINNY_DECIDE_SECRET;
+  if (!expected) {
+    // Fail closed in production-like deploys; allow local when unset
+    return process.env.NODE_ENV !== "production";
+  }
+  const header = request.headers.get("x-brainny-secret") || "";
+  const bearer = request.headers.get("authorization") || "";
+  const token = header || bearer.replace(/^Bearer\s+/i, "");
+  return token === expected;
+}
+
 export async function POST(request: Request) {
   try {
+    if (!authorized(request)) {
+      return NextResponse.json(
+        { ok: false, error: "Unauthorized — set X-Brainny-Secret header" },
+        { status: 401 },
+      );
+    }
+
     await ensureSeeded();
     const body = await request.json();
     const title = String(body.title || "").trim();

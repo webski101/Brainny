@@ -18,28 +18,140 @@ function asNumber(v: unknown, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-/** Expand casual words into graph-friendly tokens */
+const STOPWORDS = new Set([
+  "a",
+  "an",
+  "the",
+  "to",
+  "of",
+  "on",
+  "for",
+  "in",
+  "at",
+  "by",
+  "or",
+  "and",
+  "vs",
+  "versus",
+  "who",
+  "what",
+  "why",
+  "how",
+  "did",
+  "do",
+  "we",
+  "our",
+  "us",
+  "it",
+  "its",
+  "is",
+  "are",
+  "was",
+  "were",
+  "be",
+  "been",
+  "as",
+  "if",
+  "when",
+  "with",
+  "from",
+  "into",
+  "about",
+  "actually",
+  "knows",
+  "know",
+  "own",
+  "owns",
+  "ownership",
+  "decide",
+  "decided",
+  "decision",
+  "pick",
+  "chose",
+  "choose",
+  "select",
+  "should",
+  "review",
+  "refactor",
+  "change",
+  "pr",
+  "over",
+  "than",
+  "that",
+  "this",
+  "those",
+  "these",
+  "their",
+  "them",
+  "they",
+  "i",
+  "me",
+  "my",
+  "you",
+  "your",
+  "no",
+  "not",
+  "such",
+  "service",
+  "services",
+  "goes",
+  "down",
+  "outage",
+  "fails",
+  "dies",
+]);
+
+/** Expand casual words into graph-friendly tokens (stopwords stripped). */
 export function expandTopic(topic: string): string[] {
-  const t = topic.toLowerCase();
+  const t = topic.toLowerCase().trim();
   const tokens = new Set<string>();
-  for (const part of t.split(/[^a-z0-9]+/).filter(Boolean)) {
+  for (const part of t.split(/[^a-z0-9-]+/).filter(Boolean)) {
+    // Require 3+ chars so "no" cannot match "notify-hub"
+    if (part.length < 3 || STOPWORDS.has(part)) continue;
     tokens.add(part);
+    // settlements → settle, card-rails kept as whole + parts
+    if (part.endsWith("s") && part.length > 4) tokens.add(part.slice(0, -1));
+    if (part.includes("-")) {
+      for (const bit of part.split("-")) {
+        if (bit.length >= 3 && !STOPWORDS.has(bit)) tokens.add(bit);
+      }
+    }
   }
-  if (t.includes("payment") || t.includes("psp") || t.includes("card")) {
+  // Only broaden when the topic is clearly about payments broadly — not a named service
+  const namedService =
+    /card-rails|ledger-core|settlement|fraud-engine|webhooks|partner-sdk|identity|billing-ui|notify-hub/.test(
+      t,
+    );
+  if (
+    !namedService &&
+    (t.includes("payment") || t.includes("psp") || /\bcards?\b/.test(t))
+  ) {
     tokens.add("rails");
     tokens.add("card");
     tokens.add("ledger");
     tokens.add("settle");
     tokens.add("payment");
   }
-  if (t.includes("refactor")) tokens.add("rails");
+  if (!namedService && t.includes("refactor")) tokens.add("rails");
   if (t.includes("fraud") || t.includes("aml")) tokens.add("fraud");
   if (t.includes("adyen") || t.includes("stripe")) {
-    tokens.add("rails");
     tokens.add("adyen");
     tokens.add("stripe");
+    tokens.add("psp");
+  }
+  if (t.includes("freeze") || t.includes("imbalance")) {
+    tokens.add("freeze");
+    tokens.add("settlement");
+    tokens.add("ledger");
+    tokens.add("imbalance");
   }
   return [...tokens];
+}
+
+/** Display name with (left) for inactive people */
+export function personLabel(name: string, active?: boolean | null) {
+  if (active === false) return `${name} (left)`;
+  return name;
 }
 
 export async function findExperts(topic: string) {
@@ -78,17 +190,19 @@ export async function findExperts(topic: string) {
   }>(cypher, { tokens });
 
   const people: ExpertiseHit[] = rows.map((r) => {
+    const active = Boolean(r.active);
+    const name = asString(r.name);
     const reasons = [
       ...(r.services || []).slice(0, 2).map((s) => `knows ${s}`),
       ...(r.prs || []).filter(Boolean).slice(0, 1).map((p) => `PR: ${p}`),
       ...(r.incs || []).filter(Boolean).slice(0, 1).map((i) => `incident: ${i}`),
     ];
     return {
-      name: asString(r.name),
+      name: personLabel(name, active),
       role: asString(r.role),
       team: asString(r.team),
       score: asNumber(r.score),
-      active: Boolean(r.active),
+      active,
       reasons,
     };
   });
@@ -125,7 +239,8 @@ export async function busFactor(personName?: string) {
       WITH p, s, myWeight, others, otherWeight,
            CASE WHEN otherWeight = 0 THEN 1.0
                 ELSE toFloat(myWeight) / (myWeight + otherWeight) END AS concentration
-      RETURN p.name AS person, s.name AS service, s.criticality AS criticality,
+      RETURN p.name AS person, p.active AS personActive,
+             s.name AS service, s.criticality AS criticality,
              others AS people, concentration
       ORDER BY concentration DESC
     `
@@ -151,7 +266,18 @@ export async function busFactor(personName?: string) {
   const busFactorHits: BusFactorHit[] = rows.map((r) => {
     const concentration = asNumber(r.concentration);
     const criticality = asString(r.criticality);
-    const people = (Array.isArray(r.people) ? r.people : []).filter(Boolean).map(String);
+    const rawPeople = (Array.isArray(r.people) ? r.people : [])
+      .filter(Boolean)
+      .map(String);
+    const peopleActive = (Array.isArray(r.peopleActive)
+      ? r.peopleActive
+      : []) as boolean[];
+    const focusActive =
+      r.personActive === undefined ? true : Boolean(r.personActive);
+    const focusName = r.person ? asString(r.person) : undefined;
+    const people = rawPeople.map((n, i) =>
+      personLabel(n, peopleActive[i] ?? true),
+    );
     let risk: BusFactorHit["risk"] = "low";
     if (
       concentration >= 0.75 &&
@@ -168,11 +294,15 @@ export async function busFactor(personName?: string) {
       criticalPeople: people.slice(0, 3),
       score: Math.round(concentration * 100),
       risk,
+      focusPerson: focusName
+        ? personLabel(focusName, focusActive)
+        : undefined,
+      focusActive,
     };
   });
 
   const path: PathHop[] = busFactorHits.slice(0, 5).map((b) => ({
-    from: b.criticalPeople[0] || "unknown",
+    from: b.focusPerson || b.criticalPeople[0] || "unknown",
     rel: "BUS_FACTOR",
     to: b.service,
     detail: `${b.score}% concentration · ${b.risk}`,
@@ -185,11 +315,45 @@ export async function busFactor(personName?: string) {
     status: b.risk === "critical" || b.risk === "high" ? "stale" : "active",
   }));
 
-  return { busFactor: busFactorHits, path, sources, cypher: [used], person: personName };
+  const person =
+    busFactorHits[0]?.focusPerson ||
+    (personName ? personLabel(personName, true) : undefined);
+
+  return { busFactor: busFactorHits, path, sources, cypher: [used], person };
+}
+
+function scoreDecisionMatch(
+  title: string,
+  summary: string,
+  tokens: string[],
+  hint: string,
+): number {
+  const t = title.toLowerCase();
+  const s = summary.toLowerCase();
+  const h = hint.toLowerCase();
+  let score = 0;
+  if (h && t.includes(h)) score += 50;
+  if (h && s.includes(h)) score += 20;
+  for (const token of tokens) {
+    if (t.includes(token)) score += 10;
+    else if (s.includes(token)) score += 4;
+  }
+  return score;
 }
 
 export async function decisionAutopsy(topic: string) {
   const tokens = expandTopic(topic);
+  const hint = topic.toLowerCase().replace(/[^a-z0-9\s-]+/g, " ").trim();
+  if (!tokens.length) {
+    return {
+      decision: null as DecisionHit | null,
+      path: [] as PathHop[],
+      sources: [] as SourceRef[],
+      cypher: [] as string[],
+      abstain: true as const,
+      reason: `No decision in the company graph matches “${topic}”.`,
+    };
+  }
   const cypher = `
     MATCH (d:Decision)
     WHERE ANY(token IN $tokens WHERE
@@ -201,11 +365,13 @@ export async function decisionAutopsy(topic: string) {
     OPTIONAL MATCH (d)-[:CITES]->(src)
     RETURN d.id AS id, d.title AS title, d.summary AS summary,
            d.decidedAt AS decidedAt, d.status AS status,
-           newer.id AS supersededBy,
+           newer.id AS supersededById,
+           newer.title AS supersededByTitle,
            collect(DISTINCT owner.name) AS owners,
+           collect(DISTINCT owner.active) AS ownerActive,
            collect(DISTINCT coalesce(src.title, src.id)) AS cites
     ORDER BY d.decidedAt DESC
-    LIMIT 5
+    LIMIT 10
   `;
   const { rows, cypher: used } = await runQuery<Record<string, unknown>>(cypher, {
     tokens,
@@ -222,25 +388,50 @@ export async function decisionAutopsy(topic: string) {
     };
   }
 
-  // Prefer an active decision when the topic hits both old + new
-  const preferred =
-    rows.find((r) => asString(r.status) === "active" && !r.supersededBy) || rows[0];
+  const ranked = [...rows].sort((a, b) => {
+    const sa = scoreDecisionMatch(
+      asString(a.title),
+      asString(a.summary),
+      tokens,
+      hint,
+    );
+    const sb = scoreDecisionMatch(
+      asString(b.title),
+      asString(b.summary),
+      tokens,
+      hint,
+    );
+    if (sb !== sa) return sb - sa;
+    const aActive = asString(a.status) === "active" && !a.supersededById ? 1 : 0;
+    const bActive = asString(b.status) === "active" && !b.supersededById ? 1 : 0;
+    return bActive - aActive;
+  });
+  const preferred = ranked[0];
 
   const status = asString(preferred.status, "active") as DecisionHit["status"];
-  const supersededBy = preferred.supersededBy
-    ? asString(preferred.supersededBy)
+  const supersededByTitle = preferred.supersededByTitle
+    ? asString(preferred.supersededByTitle)
     : undefined;
+  const supersededById = preferred.supersededById
+    ? asString(preferred.supersededById)
+    : undefined;
+
+  const ownerNames = (Array.isArray(preferred.owners) ? preferred.owners : [])
+    .filter(Boolean)
+    .map(String);
+  const ownerActive = (Array.isArray(preferred.ownerActive)
+    ? preferred.ownerActive
+    : []) as boolean[];
 
   const decision: DecisionHit = {
     id: asString(preferred.id),
     title: asString(preferred.title),
     summary: asString(preferred.summary),
     decidedAt: asString(preferred.decidedAt),
-    status: supersededBy || status === "superseded" ? "superseded" : "active",
-    supersededBy,
-    owners: (Array.isArray(preferred.owners) ? preferred.owners : [])
-      .filter(Boolean)
-      .map(String),
+    status:
+      supersededById || status === "superseded" ? "superseded" : "active",
+    supersededBy: supersededByTitle || supersededById,
+    owners: ownerNames.map((n, i) => personLabel(n, ownerActive[i])),
     cites: (Array.isArray(preferred.cites) ? preferred.cites : [])
       .filter(Boolean)
       .map(String),
@@ -259,11 +450,11 @@ export async function decisionAutopsy(topic: string) {
     })),
   ];
 
-  if (decision.status === "superseded") {
+  if (decision.status === "superseded" && supersededByTitle) {
     path.push({
-      from: decision.supersededBy || "newer decision",
+      from: supersededByTitle,
       rel: "SUPERSEDES",
-      to: decision.id,
+      to: decision.title,
       detail: "This decision is no longer active",
     });
   }
@@ -293,34 +484,52 @@ export async function decisionAutopsy(topic: string) {
     cypher: [used],
     abstain,
     reason: abstain
-      ? `Decision “${decision.title}” is superseded${decision.supersededBy ? ` by ${decision.supersededBy}` : ""}. Citing it as current policy would be wrong.`
+      ? `Decision “${decision.title}” is superseded${supersededByTitle ? ` by “${supersededByTitle}”` : ""}. Citing it as current policy would be wrong.`
       : undefined,
   };
 }
 
 export async function whoOwns(serviceHint: string) {
   const tokens = expandTopic(serviceHint);
+  const hint = serviceHint
+    .toLowerCase()
+    .replace(/\bvs\b.*$/i, "")
+    .replace(/[^a-z0-9-]+/g, " ")
+    .trim();
   const cypher = `
     MATCH (s:Service)
-    WHERE ANY(token IN $tokens WHERE
-      toLower(s.name) CONTAINS token OR
-      toLower(s.desc) CONTAINS token
-    )
+    WHERE toLower(s.name) CONTAINS $hint
+       OR ANY(token IN $tokens WHERE
+            toLower(s.name) CONTAINS token OR
+            toLower(s.desc) CONTAINS token)
+    WITH s,
+      CASE
+        WHEN toLower(s.name) = $hint THEN 0
+        WHEN toLower(s.name) CONTAINS $hint THEN 1
+        WHEN ANY(token IN $tokens WHERE toLower(s.name) CONTAINS token) THEN 2
+        ELSE 3
+      END AS rank
+    ORDER BY rank ASC
+    WITH s LIMIT 1
     OPTIONAL MATCH (declared:Person)-[:OWNS {declared:true}]->(s)
     OPTIONAL MATCH (knower:Person)-[k:KNOWS]->(s)
     WHERE knower.active = true
-    OPTIONAL MATCH (knower)-[:MEMBER_OF]->(t:Team)
+    WITH s,
+      collect(DISTINCT declared) AS declaredNodes,
+      collect(DISTINCT knower) AS knowerNodes,
+      collect(DISTINCT k) AS knowRels
     RETURN s.name AS service, s.desc AS desc, s.criticality AS criticality,
-           collect(DISTINCT declared.name) AS declaredOwners,
-           collect(DISTINCT knower.name) AS knowerNames,
-           collect(DISTINCT k.weight) AS knowerWeights,
-           collect(DISTINCT knower.role) AS knowerRoles
-    LIMIT 5
+           [d IN declaredNodes WHERE d IS NOT NULL | d.name] AS declaredOwners,
+           [d IN declaredNodes WHERE d IS NOT NULL | d.active] AS declaredActive,
+           [k IN knowerNodes WHERE k IS NOT NULL | k.name] AS knowerNames,
+           [k IN knowerNodes WHERE k IS NOT NULL | k.role] AS knowerRoles,
+           [r IN knowRels WHERE r IS NOT NULL | coalesce(r.weight, 1)] AS knowerWeights
   `;
   const { rows, cypher: used } = await runQuery<Record<string, unknown>>(cypher, {
     tokens,
+    hint,
   });
-  return { rows, cypher: [used] };
+  return { rows, cypher: [used], found: rows.length > 0 };
 }
 
 export async function companyOverview() {
@@ -372,6 +581,45 @@ export async function blastRadius(serviceHint: string) {
            knowers
     ORDER BY hops ASC, criticality DESC
   `;
+  // Resolve target first so we can distinguish unknown vs no dependents
+  const resolveCypher = `
+    MATCH (target:Service)
+    WHERE toLower(target.name) CONTAINS $hint
+       OR ANY(token IN $tokens WHERE
+            toLower(target.name) CONTAINS token OR
+            toLower(target.desc) CONTAINS token)
+    WITH target,
+      CASE
+        WHEN toLower(target.name) = $hint THEN 0
+        WHEN toLower(target.name) CONTAINS $hint THEN 1
+        WHEN ANY(token IN $tokens WHERE toLower(target.name) CONTAINS token) THEN 2
+        ELSE 3
+      END AS rank
+    ORDER BY rank ASC
+    RETURN target.name AS target
+    LIMIT 1
+  `;
+  const resolved = await runQuery<{ target: string }>(resolveCypher, {
+    tokens,
+    hint,
+  });
+  if (!resolved.rows.length) {
+    return {
+      target: null,
+      unknown: true as const,
+      rows: [] as {
+        affected: string;
+        hops: number;
+        criticality: string;
+        knowers: string[];
+      }[],
+      path: [] as PathHop[],
+      sources: [] as SourceRef[],
+      cypher: [resolved.cypher],
+    };
+  }
+
+  const targetName = asString(resolved.rows[0].target);
   const { rows, cypher: used } = await runQuery<{
     target: string;
     affected: string;
@@ -402,16 +650,19 @@ export async function blastRadius(serviceHint: string) {
   ];
 
   return {
-    target: rows[0] ? asString(rows[0].target) : null,
+    target: targetName,
+    unknown: false as const,
     rows: rows.map((r) => ({
       affected: asString(r.affected),
       hops: asNumber(r.hops),
       criticality: asString(r.criticality),
-      knowers: (Array.isArray(r.knowers) ? r.knowers : []).filter(Boolean).map(String),
+      knowers: (Array.isArray(r.knowers) ? r.knowers : [])
+        .filter(Boolean)
+        .map(String),
     })),
     path,
     sources,
-    cypher: [used],
+    cypher: [resolved.cypher, used],
   };
 }
 
@@ -430,7 +681,7 @@ export async function departureBlastRadius(personName: string) {
       hops: CASE WHEN upstream IS NULL THEN 0 ELSE length(path) END,
       criticality: upstream.criticality
     }) AS upstreams
-    RETURN p.name AS person,
+    RETURN p.name AS person, p.active AS personActive,
            s.name AS service,
            s.criticality AS criticality,
            [u IN upstreams WHERE u.name IS NOT NULL] AS upstreams
@@ -438,6 +689,7 @@ export async function departureBlastRadius(personName: string) {
   `;
   const { rows, cypher: used } = await runQuery<{
     person: string;
+    personActive: boolean;
     service: string;
     criticality: string;
     upstreams: { name: string; hops: number; criticality: string }[];
@@ -467,8 +719,12 @@ export async function departureBlastRadius(personName: string) {
     status: "active",
   }));
 
+  const person = rows[0]
+    ? personLabel(asString(rows[0].person), Boolean(rows[0].personActive))
+    : personName;
+
   return {
-    person: rows[0] ? asString(rows[0].person) : personName,
+    person,
     rows: rows.map((r) => ({
       service: asString(r.service),
       criticality: asString(r.criticality),
@@ -480,7 +736,9 @@ export async function departureBlastRadius(personName: string) {
           criticality: asString(u.criticality),
         })),
     })),
-    path,
+    path: path.map((p) =>
+      p.rel === "KNOWS" ? { ...p, from: person || p.from } : p,
+    ),
     sources,
     cypher: [used],
   };
@@ -691,6 +949,7 @@ export async function fetchGraphPayload(limit = 80): Promise<GraphPayload> {
     label: string;
     type: string;
     meta: string;
+    active: boolean | null;
   }>(
     `
     MATCH (n)
@@ -698,7 +957,8 @@ export async function fetchGraphPayload(limit = 80): Promise<GraphPayload> {
     RETURN coalesce(n.id, n.name) AS id,
            coalesce(n.name, n.title, n.id) AS label,
            labels(n)[0] AS type,
-           coalesce(n.role, n.criticality, n.status, n.severity, '') AS meta
+           coalesce(n.role, n.criticality, n.status, n.severity, '') AS meta,
+           CASE WHEN n:Person THEN n.active ELSE null END AS active
     LIMIT $limit
   `,
     { limit },
@@ -721,12 +981,18 @@ export async function fetchGraphPayload(limit = 80): Promise<GraphPayload> {
     LIMIT 120
   `);
 
-  const nodes = nodeRows.map((n) => ({
-    id: asString(n.id),
-    label: asString(n.label),
-    type: asString(n.type),
-    meta: asString(n.meta) || undefined,
-  }));
+  const nodes = nodeRows.map((n) => {
+    const type = asString(n.type);
+    const base = asString(n.label);
+    const label =
+      type === "Person" ? personLabel(base, n.active === false ? false : true) : base;
+    return {
+      id: asString(n.id),
+      label,
+      type,
+      meta: asString(n.meta) || undefined,
+    };
+  });
 
   const edges = edgeRows
     .map((e, i) => ({
